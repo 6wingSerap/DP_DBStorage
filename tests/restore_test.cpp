@@ -1,113 +1,225 @@
-// Кэш восстановления: чтение слоёв/игроков из СУБД → упаковка строк для
-// Enforce (TAB-разделённые, Split("\t") на скриптовой стороне).
-#include "restore.hpp"
-
-#include <algorithm>
-
 #include <gtest/gtest.h>
 
-#include "fake_db.hpp"
+#include "players.hpp"
+#include "restore.hpp"
+#include "support.hpp"
+#include "sync.hpp"
+
+using namespace dpdb;
 
 namespace {
 
-dpdb::DbRow row(std::initializer_list<dpdb::Val> cols) {
-    dpdb::DbRow r;
-    for (const auto& c : cols)
-        r.cols.push_back(c);
-    return r;
+struct RestoreTest : ::testing::Test {
+    test::TempDir dir;
+    fs::Path root = dir / "storage_1";
+    fs::Path attic = dir / "quarantine";
+    Store store{dir / "s.db", [](std::string_view) {}};
+    SkipCache skip;
+    std::vector<std::string> log;
+    Log logger = [this](std::string_view s) { log.emplace_back(s); };
+
+    std::int64_t capture(bool deletions = true) {
+        auto w = store.begin("cycle");
+        sync_files(store, w, root, {.deletions = deletions}, skip);
+        capture_players(store, w, root / "players.db", dir.path);
+        return w.commit();
+    }
+    RestoreReport fix() { return repair(store, root, skip, check_players(root / "players.db"), attic, logger); }
+    void players(std::string_view uid, std::string_view data) {
+        std::filesystem::create_directories(root);
+        sql::Db e(root / "players.db", sql::kReadWrite | sql::kCreate);
+        e.exec("CREATE TABLE IF NOT EXISTS DB_Versions(Id INTEGER PRIMARY KEY NOT NULL, Structure INTEGER NOT NULL"
+               " DEFAULT 0); CREATE TABLE IF NOT EXISTS Players(Id INTEGER PRIMARY KEY NOT NULL, Alive INTEGER NOT"
+               " NULL, UID CHAR(64) UNIQUE NOT NULL, Data BLOB NULL)");
+        const fs::Bytes b = test::bytes(data);
+        e.prepare("INSERT OR REPLACE INTO Players(Id, Alive, UID, Data) VALUES(1, 1, ?, ?)")
+            .bind(1, uid)
+            .bind(2, std::span<const std::byte>(b))
+            .step();
+    }
+    std::string player_data() {
+        sql::Db e(root / "players.db", sql::kReadOnly);
+        auto q = e.prepare("SELECT Data FROM Players WHERE Id = 1");
+        return q.step() ? test::str(q.blob(0)) : "<нет>";
+    }
+};
+
+fs::Bytes layer(std::uint32_t fmt, std::uint32_t stamp, std::string_view payload) {
+    return make_layer("STORAGE_DYNAMIC", fmt, 144, stamp, test::bytes(payload));
+}
+
+std::string str(const fs::Bytes& b) {
+    return test::str(b);
 }
 
 }  // namespace
 
-TEST(Restore, LayerRoundtrip) {
-    dpdb::test::FakeDb db;
-    db.replies.push_back({
-        row({"CivilianSedan", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8500.0, std::int64_t{1}}),
-        row({"SeaChest", 10.0, 20.0, 30.0, 0.0, 0.0, 0.0, 100.0, std::int64_t{2}}),
-    });
-    dpdb::DbRow item1;
-    // entity_idx, parent, slot, type, health, quantity, ammo, liquid, liq_vol,
-    // food, wet, temp, extra
-    item1.cols = {std::int64_t{1}, std::int64_t{0}, std::string(""),
-                  std::string("SparkPlug"), 80.0, -1.0, std::int64_t{-1},
-                  std::int64_t{-1}, -1.0, std::int64_t{-1}, 0.0, 0.0,
-                  dpdb::Val{}};
-    dpdb::DbRow item2;
-    item2.cols = {std::int64_t{2}, std::int64_t{0}, std::string("C0_0"),
-                  std::string("SodaCan_Cola"), 90.0, 45.0, std::int64_t{-1},
-                  std::int64_t{-1}, -1.0, std::int64_t{-1}, 0.0, 0.0,
-                  dpdb::Val{}};
-    db.replies.push_back({item1, item2});
+TEST_F(RestoreTest, MissingFilesComeBackExistingStayUntouched) {
+    test::write(root / "data/a.bin", "a1");
+    test::write(root / "data/b.bin", "b1");
+    capture();
+    std::filesystem::remove(root / "data/a.bin");
+    test::write(root / "data/b.bin", "b2 on disk is newer");
 
-    dpdb::Restore r;
-    std::string err;
-    ASSERT_TRUE(r.load_layer(db, "vehicles", err)) << err;
-    EXPECT_EQ(r.count("vehicles"), 2);
-    EXPECT_EQ(r.count("zombies"), -1);
-    EXPECT_TRUE(r.ready());
-
-    const std::string ent = r.entity("vehicles", 0);
-    EXPECT_NE(ent.find("CivilianSedan"), std::string::npos);
-    EXPECT_NE(ent.find("8500"), std::string::npos);
-    EXPECT_EQ(r.entity("vehicles", 2), "");          // за границей
-    EXPECT_EQ(r.entity("zombies", 0), "");
-
-    EXPECT_EQ(r.items_count("vehicles", 0), 1);
-    const std::string it0 = r.item("vehicles", 0, 0);
-    EXPECT_NE(it0.find("SparkPlug"), std::string::npos);
-    EXPECT_EQ(std::count(it0.begin(), it0.end(), '\t'), 11);   // 12 полей
-    EXPECT_EQ(r.item("vehicles", 0, 1), "");
-    EXPECT_EQ(r.items_count("vehicles", 1), 1);      // SeaChest с карго
+    const auto r = fix();
+    EXPECT_EQ(r.restored, 1);
+    EXPECT_EQ(r.repaired, 0);
+    EXPECT_EQ(test::read(root / "data/a.bin"), "a1");
+    EXPECT_EQ(test::read(root / "data/b.bin"), "b2 on disk is newer");
 }
 
-TEST(Restore, PlayerLoadAndMiss) {
-    dpdb::test::FakeDb db;
-    dpdb::DbRow p;
-    p.cols = {std::int64_t{1}, 100.0, 200.0, 300.0, 90.0, 95.0, 5000.0, 2500.0,
-              1500.0, std::string("Tester")};
-    db.replies.push_back({p});
-    dpdb::DbRow item;
-    item.cols = {std::int64_t{0}, std::string(""), std::string("TShirt_Beige"),
-                 100.0, -1.0, std::int64_t{-1}, std::int64_t{-1}, -1.0,
-                 std::int64_t{-1}, 0.0, 0.0, dpdb::Val{}};
-    db.replies.push_back({item});
+TEST_F(RestoreTest, WholeStorageIsRebuiltFromNothing) {
+    test::write(root / "data/dynamic_000.bin", layer(39, 5, "world"));
+    test::write(root / "spawnpoints.bin", "sp");
+    test::write(root / "communityframework/deep/mod.bin", "cf");
+    players("uid-a", "character");
+    capture();
+    std::filesystem::remove_all(root);
 
-    dpdb::Restore r;
-    std::string err;
-    ASSERT_EQ(r.load_player(db, "pP0uid_test_1234", err), 1) << err;
-    const std::string packed = r.player("pP0uid_test_1234");
-    EXPECT_NE(packed.find("Tester"), std::string::npos);
-    EXPECT_NE(packed.find("5000"), std::string::npos);
-    EXPECT_EQ(r.player_items_count("pP0uid_test_1234"), 1);
-    EXPECT_NE(r.player_item("pP0uid_test_1234", 0).find("TShirt_Beige"),
-              std::string::npos);
-
-    // игрока нет в базе — "MISS" (скрипт даст свежего персонажа)
-    dpdb::test::FakeDb db2;
-    db2.replies.push_back({});
-    db2.replies.push_back({});
-    ASSERT_EQ(r.load_player(db2, "pP0missing_uid_9", err), 0);
-    EXPECT_EQ(r.player("pP0missing_uid_9"), "MISS");
-    EXPECT_EQ(r.player("pP0never_requested_"), "");   // не готов
+    const auto r = fix();
+    EXPECT_EQ(r.restored, 3);
+    EXPECT_TRUE(r.players);
+    EXPECT_EQ(test::read(root / "data/dynamic_000.bin"), str(layer(39, 5, "world")));
+    EXPECT_EQ(test::read(root / "communityframework/deep/mod.bin"), "cf");
+    EXPECT_EQ(player_data(), "character");
 }
 
-TEST(Restore, RequestQueueDedup) {
-    dpdb::Restore r;
-    r.request_player("pP0uid_test_1234");
-    r.request_player("pP0uid_test_1234");   // дубль в очереди не нужен
-    std::string uid;
-    EXPECT_TRUE(r.has_request(uid));
-    EXPECT_EQ(uid, "pP0uid_test_1234");
-    EXPECT_FALSE(r.has_request(uid));
+// Краш посреди сохранения: слот оборван. Движок с storageAutoFix=0 такой файл не отсеял бы.
+TEST_F(RestoreTest, TornLayerIsReplacedByLastGoodVersion) {
+    test::write(root / "data/dynamic_000.bin", layer(39, 5, "good"));
+    capture();
+    auto torn = layer(39, 6, "newer, but the write never finished");
+    torn.resize(torn.size() - 10);
+    test::write(root / "data/dynamic_000.bin", torn);
+    capture(false);   // проход старта: оборванный файл в базу не берётся
+
+    const auto r = fix();
+    EXPECT_EQ(r.repaired, 1);
+    EXPECT_EQ(test::read(root / "data/dynamic_000.bin"), str(layer(39, 5, "good")));
 }
 
-TEST(Restore, PackFormatsStable) {
-    dpdb::RestoredItem it;
-    it.parent = 3;
-    it.slot = "S42";
-    it.type = "Ammo_556";
-    it.health = 55.5f;
-    const std::string p = dpdb::pack_item(it);
-    // 12 полей, TAB-разделённые — формат фиксирует скриптовая сторона Split
-    EXPECT_EQ(std::count(p.begin(), p.end(), '\t'), 11);
+// Формат сменился (патч игры), и первая же запись оборвалась: наше знание раскладки на
+// этой версии ещё ничем не подтверждено — файл не трогаем.
+TEST_F(RestoreTest, TornLayerOfUnprovenFormatIsLeftAlone) {
+    test::write(root / "data/dynamic_000.bin", layer(39, 5, "good"));
+    capture();
+    auto torn = layer(40, 6, "new format, torn");
+    torn.resize(torn.size() - 10);
+    test::write(root / "data/dynamic_000.bin", torn);
+    capture(false);
+
+    const auto r = fix();
+    EXPECT_EQ(r.repaired, 0);
+    EXPECT_EQ(test::read(root / "data/dynamic_000.bin"), str(torn));
+}
+
+// Отключение питания: слот остался обнулённым. Формат тут ни при чём — версия не важна.
+TEST_F(RestoreTest, BlankFileInPlaceOfLayerIsReplaced) {
+    test::write(root / "data/dynamic_000.bin", layer(39, 5, "good"));
+    test::write(root / "mod/empty.lock", "");
+    capture();
+    test::write(root / "data/dynamic_000.bin", fs::Bytes(500));
+    capture(false);
+
+    const auto r = fix();
+    EXPECT_EQ(r.repaired, 1);
+    EXPECT_EQ(test::read(root / "data/dynamic_000.bin"), str(layer(39, 5, "good")));
+    EXPECT_EQ(test::read(root / "mod/empty.lock"), "");
+}
+
+TEST_F(RestoreTest, DamagedBlobIsNeverWrittenToDisk) {
+    test::write(root / "a.bin", "a1");
+    test::write(root / "b.bin", "b1");
+    capture();
+    std::filesystem::remove_all(root);
+    store.db().exec("UPDATE blobs SET data = x'00' WHERE id = (SELECT blob FROM files WHERE path = 'a.bin')");
+
+    const auto r = fix();
+    EXPECT_EQ(r.failed, 1);
+    EXPECT_EQ(r.restored, 1);
+    EXPECT_FALSE(std::filesystem::exists(root / "a.bin"));
+    EXPECT_EQ(test::read(root / "b.bin"), "b1");
+    EXPECT_FALSE(log.empty());
+}
+
+TEST_F(RestoreTest, StaleTempFilesAreSwept) {
+    test::write(root / "data/a.bin", "a1");
+    capture();
+    test::write(root / "data/a.bin.dpdb-tmp", "half-written by a previous run");
+    fix();
+    EXPECT_FALSE(std::filesystem::exists(root / "data/a.bin.dpdb-tmp"));
+}
+
+TEST_F(RestoreTest, HealthyPlayersDatabaseIsNotTouched) {
+    players("uid-a", "v1");
+    capture();
+    players("uid-a", "v2 newer on disk");
+    EXPECT_FALSE(fix().players);
+    EXPECT_EQ(player_data(), "v2 newer on disk");
+}
+
+TEST_F(RestoreTest, CorruptPlayersDatabaseIsSetAsideAndRebuilt) {
+    players("uid-a", "v1");
+    capture();
+    test::write(root / "players.db", std::string(8192, 'x'));
+
+    EXPECT_TRUE(fix().players);
+    EXPECT_EQ(player_data(), "v1");
+    ASSERT_EQ(fs::scan(attic).size(), 1u) << "испорченный файл сохраняется для разбора";
+    EXPECT_EQ(fs::scan(attic)[0].size, 8192);
+}
+
+TEST_F(RestoreTest, CorruptPlayersDatabaseWithNothingToRestoreIsLeftAlone) {
+    test::write(root / "players.db", std::string(8192, 'x'));
+    EXPECT_FALSE(fix().players);
+    EXPECT_EQ(test::read(root / "players.db"), std::string(8192, 'x'));
+}
+
+TEST_F(RestoreTest, MaterializeMakesDirectoryExactlyTheGeneration) {
+    test::write(root / "data/a.bin", "a1");
+    test::write(root / "data/gone-later.bin", "x");
+    players("uid-a", "p1");
+    const std::int64_t g1 = capture();
+    test::write(root / "data/a.bin", "a2");
+    test::write(root / "data/new.bin", "n");
+    std::filesystem::remove(root / "data/gone-later.bin");
+    players("uid-a", "p2");
+    capture();
+
+    const auto r = materialize(store, g1, root, logger);
+    EXPECT_EQ(r.restored, 2);
+    EXPECT_EQ(r.removed, 1);
+    EXPECT_TRUE(r.players);
+    EXPECT_EQ(test::read(root / "data/a.bin"), "a1");
+    EXPECT_EQ(test::read(root / "data/gone-later.bin"), "x");
+    EXPECT_FALSE(std::filesystem::exists(root / "data/new.bin"));
+    EXPECT_EQ(player_data(), "p1");
+}
+
+TEST_F(RestoreTest, MaterializeTouchesNothingIfAnyBlobIsDamaged) {
+    test::write(root / "a.bin", "a1");
+    test::write(root / "b.bin", "b1");
+    const std::int64_t g1 = capture();
+    test::write(root / "a.bin", "a2");
+    capture();
+    store.db().exec("UPDATE blobs SET data = x'00' WHERE id = (SELECT blob FROM files WHERE path = 'b.bin')");
+
+    EXPECT_THROW(materialize(store, g1, root, logger), sql::Error);
+    EXPECT_EQ(test::read(root / "a.bin"), "a2");
+}
+
+TEST_F(RestoreTest, WipeScopes) {
+    test::write(root / "data/a.bin", "a1");
+    test::write(root / "spawnpoints.bin", "sp");
+    players("uid-a", "p1");
+    test::write(root / "players.db-journal", "j");
+
+    EXPECT_EQ(wipe(root, WipeScope::World), 2);
+    EXPECT_TRUE(std::filesystem::exists(root / "players.db"));
+    EXPECT_EQ(wipe(root, WipeScope::Players), 2);
+    EXPECT_TRUE(fs::scan(root).empty());
+
+    test::write(root / "data/a.bin", "a1");
+    players("uid-a", "p1");
+    EXPECT_EQ(wipe(root, WipeScope::All), 2);
 }

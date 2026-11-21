@@ -1,1 +1,0 @@
-Объявления нативов (grafted_natives_DP_DBStorage.c) генерируются сборкой сюда (graft.exe protogen).

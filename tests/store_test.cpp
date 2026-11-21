@@ -1,217 +1,337 @@
-// Очередь снапшотов: staging нативов → coalesce по uid/слою → SQL воркера.
-// Снапшот = полная замена (DELETE+INSERT в транзакции) — просто и безопасно.
-#include "store.hpp"
-
 #include <gtest/gtest.h>
 
-#include <string>
+#include "store.hpp"
+#include "support.hpp"
 
-#include "db.hpp"
-#include "fake_db.hpp"
+using namespace dpdb;
 
 namespace {
 
-dpdb::ItemRow item(int parent, const char* slot, const char* type,
-                   float health = 100, float quantity = -1) {
-    dpdb::ItemRow r;
-    r.parent = parent;
-    r.slot = slot;
-    r.type = type;
-    r.health = health;
-    r.quantity = quantity;
-    return r;
-}
+constexpr std::int64_t kHour = 3'600'000;
+
+struct StoreTest : ::testing::Test {
+    test::TempDir dir;
+    fs::Path db = dir / "s.db";
+    std::vector<std::string> log;
+
+    Store open() {
+        return Store(db, [this](std::string_view s) { log.emplace_back(s); });
+    }
+    static std::int64_t put(Store& s, std::string_view path, std::string_view text, std::int64_t now = 1000) {
+        auto w = s.begin("cycle", "1.30", "", now);
+        w.put_file(path, test::bytes(text), 1, {});
+        return w.commit();
+    }
+    static std::string content(Store& s, std::int64_t gen, const std::string& path) {
+        const State st = s.state(gen);
+        const auto it = st.files.find(path);
+        return it == st.files.end() ? "<нет>" : test::str(s.blob(it->second));
+    }
+};
 
 }  // namespace
 
-TEST(Store, PlayerFlowEndToEnd) {
-    dpdb::Store s;
-    EXPECT_EQ(s.player_begin("pP0uid_test_1234", "Tester", 1, 100, 200, 300, 90,
-                             95, 5000, 2500, 1500),
-              "");
-    EXPECT_EQ(s.player_item(item(0, "", "TShirt_Beige")), 1);
-    EXPECT_EQ(s.player_item(item(1, "Body", "SodaCan_Cola", 80, 45)), 2);
-    EXPECT_EQ(s.player_end(), "");
-    EXPECT_EQ(s.pending_players(), size_t{1});
+TEST_F(StoreTest, FreshDatabaseIsEmpty) {
+    Store s = open();
+    EXPECT_EQ(s.head_gen(), 0);
+    EXPECT_TRUE(s.files().empty());
+    EXPECT_TRUE(s.chars().empty());
+    EXPECT_FALSE(s.was_quarantined());
 }
 
-TEST(Store, PlayerInvalidUidRejected) {
-    dpdb::Store s;
-    EXPECT_NE(s.player_begin("ab", "X", 1, 0, 0, 0, 0, 0, 0, 0, 0).find("ERROR"),
-              std::string::npos);
-    EXPECT_EQ(s.player_item(item(0, "", "TShirt_Beige")), 0);  // сессии нет
-    EXPECT_NE(s.player_end().find("ERROR"), std::string::npos);
-}
-
-TEST(Store, PlayerCoalescesByUid) {
-    dpdb::Store s;
-    s.player_begin("pP0uid_test_1234", "A", 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    s.player_item(item(0, "", "TShirt_Beige"));
-    s.player_end();
-    s.player_begin("pP0uid_test_1234", "A2", 1, 1, 1, 1, 0, 0, 0, 0, 0);
-    s.player_end();
-    EXPECT_EQ(s.pending_players(), size_t{1});  // в очереди последний
-    dpdb::test::FakeDb db;
-    std::string report;
-    s.drain(db, report);
-    // в SQL попало имя из последнего снапшота
-    bool found = false;
-    for (const auto& q : db.log)
-        if (q.find("'A2'") != std::string::npos)
-            found = true;
-    EXPECT_TRUE(found);
-}
-
-TEST(Store, WorldFlowEndToEnd) {
-    dpdb::Store s;
-    EXPECT_EQ(s.world_begin(), "");
-    EXPECT_EQ(s.world_entity("vehicles", "CivilianSedan", 100, 200, 300, 90, 0,
-                             0, 8500),
-              1);
-    EXPECT_EQ(s.world_item(1, item(0, "SparkPlug", "SparkPlug")), 1);
-    // второй слой в той же сессии: handle сквозной
-    EXPECT_EQ(s.world_entity("dynamic", "SeaChest", 1, 2, 3, 0, 0, 0, 100), 2);
-    EXPECT_EQ(s.world_item(2, item(0, "", "SodaCan_Cola")), 1);
-    EXPECT_EQ(s.world_item(0, item(0, "", "SodaCan_Cola")), 0);  // нет handle 0
-    EXPECT_EQ(s.world_end(), "");
-    EXPECT_EQ(s.pending_worlds(), size_t{2});
-}
-
-TEST(Store, WorldMarkExplicitEmpty) {
-    dpdb::Store s;
-    EXPECT_EQ(s.world_begin(), "");
-    EXPECT_EQ(s.world_mark("zombies"), "");
-    EXPECT_EQ(s.world_end(), "");
-    EXPECT_EQ(s.pending_worlds(), size_t{1});   // явная пустота = стереть слой
-}
-
-TEST(Store, WorldBadLayerRejected) {
-    dpdb::Store s;
-    EXPECT_EQ(s.world_begin(), "");
-    EXPECT_NE(s.world_mark("types").find("ERROR"), std::string::npos);
-    EXPECT_EQ(s.world_entity("types", "X", 0, 0, 0, 0, 0, 0, 0), 0);
-    EXPECT_EQ(s.world_end(), "");
-    EXPECT_EQ(s.pending_worlds(), size_t{0});   // ничего не отметили — пусто
-}
-
-TEST(Store, ItemCap) {
-    dpdb::Store s;
-    s.player_begin("pP0uid_test_1234", "A", 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    int last = 0;
-    for (int i = 0; i < dpdb::kMaxPlayerItems + 100; ++i)
-        last = s.player_item(item(0, "", "Ammo_556"));
-    EXPECT_LT(last, dpdb::kMaxPlayerItems + 1);   // дальше 0 — переполнение
-}
-
-TEST(Store, DrainPlayerSql) {
-    dpdb::Store s;
-    s.player_begin("pP0uid_test_1234", "Tester", 1, 1.5f, 2, 3, 90, 95, 5000,
-                   2500, 1500);
-    s.player_item(item(0, "", "TShirt_Beige"));
-    s.player_item(item(1, "Body", "SodaCan_Cola", 80, 45));
-    s.player_end();
-
-    dpdb::test::FakeDb db;
-    std::string report;
-    s.drain(db, report);
-    ASSERT_GT(db.log.size(), size_t{5});
-    EXPECT_EQ(db.log[0], "START TRANSACTION");
-    EXPECT_EQ(db.log[1], "DELETE FROM players WHERE uid='pP0uid_test_1234'");
-    EXPECT_NE(db.log[2].find("INSERT INTO players"), std::string::npos);
-    EXPECT_NE(db.log[2].find("'Tester'"), std::string::npos);
-    EXPECT_EQ(db.log[3], "DELETE FROM player_items WHERE uid='pP0uid_test_1234'");
-    EXPECT_NE(db.log[4].find("INSERT INTO player_items"), std::string::npos);
-    // обе строки предметов в одной пачке
-    EXPECT_NE(db.log[4].find("'TShirt_Beige'"), std::string::npos);
-    EXPECT_NE(db.log[4].find("'SodaCan_Cola'"), std::string::npos);
-    EXPECT_EQ(db.log.back(), "COMMIT");
-    EXPECT_EQ(s.stats().players, std::uint64_t{1});
-}
-
-TEST(Store, DrainWorldSqlCascade) {
-    dpdb::Store s;
-    s.world_begin();
-    s.world_mark("vehicles");
-    s.world_entity("vehicles", "CivilianSedan", 1, 2, 3, 4, 5, 6, 8500);
-    s.world_item(1, item(0, "SparkPlug", "SparkPlug"));
-    s.world_end();
-
-    dpdb::test::FakeDb db;
-    std::string report;
-    s.drain(db, report);
-    ASSERT_GT(db.log.size(), size_t{4});
-    EXPECT_EQ(db.log[1], "DELETE FROM world_entities WHERE layer='vehicles'");
-    // сущности раньше предметов (FK (layer,entity_idx) -> (layer,idx))
-    const auto i_ent = db.count_prefix("INSERT INTO world_entities");
-    const auto i_item = db.count_prefix("INSERT INTO entity_items");
-    EXPECT_EQ(i_ent, size_t{1});
-    EXPECT_EQ(i_item, size_t{1});
-    size_t pos_ent = 0, pos_item = 0;
-    for (size_t i = 0; i < db.log.size(); ++i) {
-        if (db.log[i].rfind("INSERT INTO world_entities", 0) == 0)
-            pos_ent = i;
-        if (db.log[i].rfind("INSERT INTO entity_items", 0) == 0)
-            pos_item = i;
+TEST_F(StoreTest, FileSurvivesReopen) {
+    {
+        Store s = open();
+        auto w = s.begin("boot", "1.30.1", "первое", 1000);
+        Facts f = inspect(make_layer("STORAGE_DYNAMIC", 39, 144, 7, {}));
+        EXPECT_TRUE(w.put_file("data/dynamic_000.bin", test::bytes("world"), 111, f));
+        EXPECT_EQ(w.commit(), 1);
+        EXPECT_EQ(s.head_gen(), 1);
     }
-    EXPECT_LT(pos_ent, pos_item);
-    EXPECT_EQ(db.log.back(), "COMMIT");
+    Store s = open();
+    ASSERT_EQ(s.files().count("data/dynamic_000.bin"), 1u);
+    const HeadFile& h = s.files().at("data/dynamic_000.bin");
+    EXPECT_EQ(h.size, 5);
+    EXPECT_EQ(h.mtime, 111);
+    EXPECT_EQ(h.gen, 1);
+    EXPECT_EQ(h.fmt, 39);
+    EXPECT_EQ(h.tag, "STORAGE_DYNAMIC");
+    EXPECT_EQ(h.hash, fs::sha256(test::bytes("world")));
+    EXPECT_EQ(test::str(s.blob(h.blob)), "world");
+    const auto gens = s.generations();
+    ASSERT_EQ(gens.size(), 1u);
+    EXPECT_EQ(gens[0].kind, "boot");
+    EXPECT_EQ(gens[0].build, "1.30.1");
+    EXPECT_EQ(gens[0].note, "первое");
+    EXPECT_EQ(gens[0].files, 1);
 }
 
-TEST(Store, DrainEmptyWorldLayer) {
-    dpdb::Store s;
-    s.world_begin();
-    s.world_mark("zombies");
-    s.world_end();
-    dpdb::test::FakeDb db;
-    std::string report;
-    s.drain(db, report);
-    EXPECT_EQ(db.log[1], "DELETE FROM world_entities WHERE layer='zombies'");
-    EXPECT_EQ(db.count_prefix("INSERT INTO"), size_t{0});
-    EXPECT_EQ(db.log.back(), "COMMIT");
+TEST_F(StoreTest, UnchangedContentMakesNoGenerationButRemembersMtime) {
+    Store s = open();
+    put(s, "a.bin", "same");
+    {
+        auto w = s.begin("cycle", "", "", 2000);
+        EXPECT_FALSE(w.put_file("a.bin", test::bytes("same"), 999, {}));
+        EXPECT_EQ(w.commit(), 0);
+    }
+    EXPECT_EQ(s.head_gen(), 1);
+    EXPECT_EQ(s.files().at("a.bin").mtime, 999);
+    Store again = open();
+    EXPECT_EQ(again.files().at("a.bin").mtime, 999);
+    EXPECT_EQ(again.generations().size(), 1u);
 }
 
-TEST(Store, DrainChunksInserts) {
-    dpdb::Store s;
-    s.player_begin("pP0uid_test_1234", "A", 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    for (int i = 0; i < 300; ++i)
-        s.player_item(item(0, "", "Ammo_556"));
-    s.player_end();
-    dpdb::test::FakeDb db;
-    std::string report;
-    s.drain(db, report);
-    // пачки по 128 строк: 300 = 128 + 128 + 44
-    EXPECT_EQ(db.count_prefix("INSERT INTO player_items"), size_t{3});
+TEST_F(StoreTest, HistoryIsReadableByGeneration) {
+    Store s = open();
+    EXPECT_EQ(put(s, "a.bin", "v1"), 1);
+    EXPECT_EQ(put(s, "a.bin", "v2"), 2);
+    {
+        auto w = s.begin("cycle", "", "", 3000);
+        w.del_file("a.bin");
+        EXPECT_EQ(w.commit(), 3);
+    }
+    EXPECT_EQ(content(s, 1, "a.bin"), "v1");
+    EXPECT_EQ(content(s, 2, "a.bin"), "v2");
+    EXPECT_EQ(content(s, 3, "a.bin"), "<нет>");
+    EXPECT_EQ(s.files().count("a.bin"), 0u);
 }
 
-TEST(Store, DrainFailureRollsBackAndCounts) {
-    dpdb::Store s;
-    s.player_begin("pP0uid_test_1234", "A", 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    s.player_item(item(0, "", "TShirt_Beige"));
-    s.player_end();
-
-    dpdb::test::FakeDb db;
-    db.replies.push_back({});      // migration-стайл не нужен, drain SELECT не делает
-    db.errors.push_back("connection lost");
-    std::string report;
-    s.drain(db, report);
-    // транзакция откачена, провал посчитан
-    EXPECT_EQ(db.log.back(), "ROLLBACK");
-    EXPECT_EQ(s.stats().failed, std::uint64_t{1});
-    EXPECT_FALSE(s.stats().last_error.empty());
-    EXPECT_EQ(s.pending_players(), size_t{0});   // снапшот не завис в очереди
+TEST_F(StoreTest, IdenticalContentIsStoredOnce) {
+    Store s = open();
+    auto w = s.begin("cycle", "", "", 1000);
+    w.put_file("building_001.bin", test::bytes("empty"), 1, {});
+    w.put_file("building_002.bin", test::bytes("empty"), 1, {});
+    w.commit();
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM blobs"), 1);
+    EXPECT_EQ(s.files().at("building_001.bin").blob, s.files().at("building_002.bin").blob);
 }
 
-TEST(Store, StageResetBySecondBegin) {
-    dpdb::Store s;
-    s.player_begin("pP0uid_test_1234", "A", 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    s.player_item(item(0, "", "TShirt_Beige"));
-    s.player_begin("pP0other_uid_5678", "B", 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    s.player_end();
-    dpdb::test::FakeDb db;
-    std::string report;
-    s.drain(db, report);
-    // предмет из первой сессии не должен попасть во второй снапшот
-    for (const auto& q : db.log)
-        if (q.rfind("INSERT INTO player_items", 0) == 0)
-            EXPECT_EQ(q.find("TShirt_Beige"), std::string::npos);
+TEST_F(StoreTest, AbandonedWriterChangesNothing) {
+    Store s = open();
+    put(s, "a.bin", "v1");
+    {
+        auto w = s.begin("cycle", "", "", 2000);
+        w.put_file("a.bin", test::bytes("v2"), 2, {});
+        w.put_file("b.bin", test::bytes("new"), 2, {});
+    }
+    EXPECT_EQ(s.head_gen(), 1);
+    EXPECT_EQ(s.files().count("b.bin"), 0u);
+    EXPECT_EQ(content(s, 1, "a.bin"), "v1");
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM generations"), 1);
+}
+
+TEST_F(StoreTest, CharactersKeepNullAndEmptyDataApart) {
+    Store s = open();
+    const fs::Bytes data = test::bytes("blob"), empty;
+    {
+        auto w = s.begin("cycle", "", "", 1000);
+        EXPECT_TRUE(w.put_char("uid-a", 1, 1, &data));
+        EXPECT_TRUE(w.put_char("uid-null", 2, 1, nullptr));
+        EXPECT_TRUE(w.put_char("uid-empty", 3, 0, &empty));
+        EXPECT_EQ(w.commit(), 1);
+    }
+    Store again = open();
+    ASSERT_EQ(again.chars().size(), 3u);
+    EXPECT_EQ(again.chars().at("uid-null").blob, 0);
+    EXPECT_NE(again.chars().at("uid-empty").blob, 0);
+    EXPECT_EQ(again.chars().at("uid-a").id, 1);
+    {
+        auto w = again.begin("cycle", "", "", 2000);
+        EXPECT_FALSE(w.put_char("uid-a", 1, 1, &data));        // то же самое
+        EXPECT_FALSE(w.put_char("uid-null", 2, 1, nullptr));
+        EXPECT_TRUE(w.put_char("uid-a", 1, 0, &data));         // умер
+        w.del_char("uid-empty");
+        EXPECT_EQ(w.commit(), 2);
+    }
+    EXPECT_EQ(again.chars().at("uid-a").alive, 0);
+    EXPECT_EQ(again.chars().count("uid-empty"), 0u);
+    EXPECT_EQ(again.state(1).chars.size(), 3u);
+    EXPECT_EQ(again.state(2).chars.size(), 2u);
+}
+
+// Первая запись ключа в поколении идёт быстрым INSERT, повторная — заменой строки.
+// Оба пути обязаны оставить в базе последнее значение и одно поколение.
+TEST_F(StoreTest, SameKeyTwiceInOneGenerationKeepsTheLastWrite) {
+    const fs::Bytes one = test::bytes("one"), two = test::bytes("two");
+    {
+        Store s = open();
+        put(s, "data/gone.bin", "was here");
+        auto w = s.begin("cycle", "", "", 2000);
+        w.put_file("data/a.bin", test::bytes("first"), 1, {});
+        w.put_file("data/a.bin", test::bytes("second"), 2, {});   // запись → запись
+        w.put_file("data/b.bin", test::bytes("b"), 1, {});
+        w.del_file("data/b.bin");                                   // запись → удаление
+        w.del_file("data/gone.bin");
+        w.put_file("data/gone.bin", test::bytes("back"), 3, {});   // удаление → запись
+        w.put_char("uid-a", 1, 1, &one);
+        w.put_char("uid-a", 1, 0, &two);
+        w.put_char("uid-b", 2, 1, &one);
+        w.del_char("uid-b");
+        EXPECT_EQ(w.commit(), 2);
+    }
+    Store s = open();
+    EXPECT_EQ(s.head_gen(), 2);
+    EXPECT_EQ(content(s, 2, "data/a.bin"), "second");
+    EXPECT_EQ(content(s, 2, "data/b.bin"), "<нет>");
+    EXPECT_EQ(content(s, 2, "data/gone.bin"), "back");
+    EXPECT_EQ(content(s, 1, "data/gone.bin"), "was here");
+    ASSERT_EQ(s.chars().count("uid-a"), 1u);
+    EXPECT_EQ(s.chars().at("uid-a").alive, 0);
+    EXPECT_EQ(test::str(s.blob(s.chars().at("uid-a").blob)), "two");
+    EXPECT_EQ(s.chars().count("uid-b"), 0u);
+    EXPECT_TRUE(s.verify().problems.empty());
+}
+
+TEST_F(StoreTest, CorruptedBlobIsDetectedNotReturned) {
+    Store s = open();
+    put(s, "a.bin", "good");
+    s.db().exec("UPDATE blobs SET data = x'626164'");
+    EXPECT_THROW(s.blob(s.files().at("a.bin").blob), sql::Error);
+    const auto v = s.verify();
+    EXPECT_EQ(v.blobs, 1);
+    EXPECT_EQ(v.problems.size(), 1u);
+}
+
+TEST_F(StoreTest, HealthyDatabaseVerifiesClean) {
+    Store s = open();
+    put(s, "a.bin", "good");
+    EXPECT_TRUE(s.verify().problems.empty());
+}
+
+TEST_F(StoreTest, ForeignSqliteFileIsRefusedAndUntouched) {
+    {
+        sql::Db other(db, sql::kReadWrite | sql::kCreate);
+        other.exec("CREATE TABLE someone_elses(x); INSERT INTO someone_elses VALUES(1)");
+    }
+    EXPECT_THROW(open(), sql::Error);
+    sql::Db other(db, sql::kReadOnly);
+    EXPECT_EQ(other.scalar("SELECT x FROM someone_elses"), 1);
+}
+
+TEST_F(StoreTest, GarbageFileIsQuarantinedAndFreshBaseCreated) {
+    test::write(db, std::string(8192, 'x'));
+    Store s = open();
+    EXPECT_TRUE(s.was_quarantined());
+    EXPECT_EQ(s.head_gen(), 0);
+    EXPECT_EQ(put(s, "a.bin", "v1"), 1);
+    bool kept = false;
+    for (const auto& e : fs::scan(dir.path))
+        kept = kept || e.rel.find("s.db.corrupt-") == 0;
+    EXPECT_TRUE(kept) << "испорченный файл должен остаться для разбора";
+}
+
+TEST_F(StoreTest, NewerSchemaIsRefused) {
+    { Store s = open(); }
+    {
+        sql::Db raw(db, sql::kReadWrite);
+        raw.exec("PRAGMA user_version = 999");
+    }
+    EXPECT_THROW(open(), sql::Error);
+}
+
+TEST_F(StoreTest, MetaRoundTrip) {
+    Store s = open();
+    EXPECT_EQ(s.meta("build"), "");
+    s.set_meta("build", "1.30");
+    s.set_meta("build", "1.31");
+    EXPECT_EQ(s.meta("build"), "1.31");
+}
+
+// ── удержание ────────────────────────────────────────────────────────────────
+
+TEST_F(StoreTest, RetentionSquashesOldHistoryButKeepsWindowExact) {
+    Store s = open();
+    put(s, "a.bin", "a1", 1 * kHour);
+    put(s, "a.bin", "a2", 2 * kHour);
+    put(s, "b.bin", "b3", 3 * kHour);
+    put(s, "a.bin", "a4", 4 * kHour);
+    put(s, "a.bin", "a5", 5 * kHour);
+
+    // сейчас = 5ч + 1мс, держим 2 часа: граница — поколение 3 (последнее старше окна)
+    const auto r = s.retain(5 * kHour + 1, 2, INT64_MAX);
+    EXPECT_EQ(r.cutoff, 3);
+    EXPECT_EQ(r.versions, 1);   // a1 заменена a2 до границы
+    EXPECT_EQ(r.blobs, 1);
+
+    EXPECT_EQ(content(s, 3, "a.bin"), "a2");
+    EXPECT_EQ(content(s, 3, "b.bin"), "b3");
+    EXPECT_EQ(content(s, 4, "a.bin"), "a4");
+    EXPECT_EQ(content(s, 5, "a.bin"), "a5");
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM generations WHERE gen = 1"), 0);
+    EXPECT_TRUE(s.verify().problems.empty());
+}
+
+TEST_F(StoreTest, RetentionNeverTouchesPinnedGeneration) {
+    Store s = open();
+    put(s, "a.bin", "a1", 1 * kHour);
+    put(s, "a.bin", "a2", 2 * kHour);
+    put(s, "a.bin", "a3", 3 * kHour);
+    s.pin(1, true, "перед обновлением игры");
+    s.retain(100 * kHour, 1, 0);   // и по времени, и по размеру — схлопнуть всё
+    EXPECT_EQ(content(s, 1, "a.bin"), "a1");
+    EXPECT_EQ(content(s, 3, "a.bin"), "a3");
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM files"), 2);   // a2 ушла
+    const auto gens = s.generations();
+    EXPECT_TRUE(gens.back().pinned);
+    EXPECT_EQ(gens.back().note, "перед обновлением игры");
+}
+
+TEST_F(StoreTest, OnlyPinnedOrUnsquashedGenerationsAreRestorable) {
+    Store s = open();
+    for (int i = 1; i <= 5; ++i)
+        put(s, "a.bin", "a" + std::to_string(i), i * kHour);
+    put(s, "b.bin", "b6", 6 * kHour);
+    s.pin(2, true, "");
+    EXPECT_TRUE(s.restorable(1));
+    s.retain(6 * kHour, 2, INT64_MAX);   // граница — поколение 4
+    EXPECT_FALSE(s.restorable(1)) << "поколения больше нет";
+    EXPECT_TRUE(s.restorable(2)) << "закреплено";
+    EXPECT_FALSE(s.restorable(3));
+    EXPECT_TRUE(s.restorable(4));
+    EXPECT_TRUE(s.restorable(6));
+    EXPECT_FALSE(s.restorable(7));
+    EXPECT_EQ(content(s, 2, "a.bin"), "a2");
+}
+
+TEST_F(StoreTest, RetentionDropsTombstonesWithNothingBehindThem) {
+    Store s = open();
+    put(s, "a.bin", "a1", 1 * kHour);
+    {
+        auto w = s.begin("cycle", "", "", 2 * kHour);
+        w.del_file("a.bin");
+        w.commit();
+    }
+    put(s, "b.bin", "b3", 3 * kHour);
+    s.retain(100 * kHour, 1, INT64_MAX);
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM files WHERE path = 'a.bin'"), 0);
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM blobs"), 1);
+    EXPECT_EQ(content(s, 3, "b.bin"), "b3");
+}
+
+TEST_F(StoreTest, SizeLimitSquashesEvenFreshHistoryDownToHead) {
+    Store s = open();
+    for (int i = 1; i <= 6; ++i)
+        put(s, "a.bin", std::string(200'000, static_cast<char>('a' + i)), i * kHour);
+    const std::int64_t before = s.used_bytes();
+    s.retain(6 * kHour + 1, 1000, 400'000);   // окно огромное, но база больше лимита
+    EXPECT_LT(s.used_bytes(), before);
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM blobs"), 1);
+    EXPECT_EQ(content(s, 6, "a.bin"), std::string(200'000, 'g'));
+    EXPECT_EQ(s.files().at("a.bin").size, 200'000);
+}
+
+TEST_F(StoreTest, RetentionKeepsCharactersConsistent) {
+    Store s = open();
+    const fs::Bytes d1 = test::bytes("d1"), d2 = test::bytes("d2");
+    for (int i = 1; i <= 3; ++i) {
+        auto w = s.begin("cycle", "", "", i * kHour);
+        w.put_char("uid", 1, 1, i == 1 ? &d1 : &d2);
+        if (i == 3)
+            w.put_char("uid", 1, 0, &d2);
+        w.commit();
+    }
+    s.retain(100 * kHour, 1, INT64_MAX);
+    ASSERT_EQ(s.state(s.head_gen()).chars.size(), 1u);
+    EXPECT_EQ(s.state(s.head_gen()).chars[0].alive, 0);
+    EXPECT_EQ(s.db().scalar("SELECT count(*) FROM blobs"), 1);
 }

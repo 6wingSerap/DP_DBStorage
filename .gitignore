@@ -5,3 +5,4 @@ dist/
 .vscode/
 .zcode/
 CMakeUserPresets.json
+.claude

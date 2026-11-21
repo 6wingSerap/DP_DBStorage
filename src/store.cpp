@@ -1,390 +1,507 @@
 #include "store.hpp"
 
 #include <algorithm>
-#include <array>
-#include <cmath>
 #include <format>
-#include <utility>
-
-#include "validate.hpp"
 
 namespace dpdb {
 
 namespace {
 
-// Дробное в SQL: без бесконечностей/NaN (скрипт мог передать мусор).
-std::string f(float v) {
-    return std::isfinite(v) ? std::format("{}", static_cast<double>(v)) : "NULL";
-}
+constexpr std::int64_t kAppId = 0x44504442;   // 'DPDB': по нему отличаем свою базу от чужой
 
-// Неотрицательное дробное: отрицательное = «поля нет» → NULL
-// (quantity/liquid_vol/wetness отрицательными не бывают).
-std::string opt_f(float v) {
-    return v >= 0 && std::isfinite(v) ? std::format("{}", static_cast<double>(v))
-                                      : "NULL";
-}
+// Схема меняется только добавлением миграции в конец; существующие не правятся.
+// user_version базы = число применённых миграций.
+constexpr std::string_view kMigrations[] = {
+    R"sql(
+CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE generations(
+    gen    INTEGER PRIMARY KEY,
+    ts     INTEGER NOT NULL,              -- unix, мс
+    kind   TEXT    NOT NULL,              -- boot | cycle | restore | wipe | …
+    build  TEXT    NOT NULL DEFAULT '',   -- версия exe игры
+    pinned INTEGER NOT NULL DEFAULT 0,    -- удержание не трогает
+    note   TEXT    NOT NULL DEFAULT '');
+CREATE TABLE blobs(
+    id   INTEGER PRIMARY KEY,
+    hash BLOB    NOT NULL UNIQUE,         -- SHA-256 содержимого
+    size INTEGER NOT NULL,
+    data BLOB    NOT NULL);
+CREATE TABLE files(
+    path  TEXT    NOT NULL,               -- от корня storage: '/', нижний регистр
+    gen   INTEGER NOT NULL REFERENCES generations(gen),
+    blob  INTEGER REFERENCES blobs(id),   -- NULL — файл удалён
+    mtime INTEGER NOT NULL DEFAULT 0,     -- mtime на диске при захвате: ускоритель, не истина
+    fmt   INTEGER,                        -- заголовок слоя CE, NULL — не слой
+    save  INTEGER,
+    stamp INTEGER,
+    tag   TEXT,
+    PRIMARY KEY(path, gen));
+CREATE INDEX files_gen  ON files(gen);
+CREATE INDEX files_blob ON files(blob);
+CREATE TABLE characters(
+    uid   TEXT    NOT NULL,               -- Players.UID
+    gen   INTEGER NOT NULL REFERENCES generations(gen),
+    id    INTEGER,                        -- Players.Id
+    alive INTEGER,
+    blob  INTEGER REFERENCES blobs(id),   -- Players.Data, NULL — Data NULL
+    gone  INTEGER NOT NULL DEFAULT 0,     -- 1 — строки в Players больше нет
+    PRIMARY KEY(uid, gen));
+CREATE INDEX characters_gen  ON characters(gen);
+CREATE INDEX characters_blob ON characters(blob);
+)sql",
+};
+constexpr int kSchemaVersion = static_cast<int>(std::size(kMigrations));
 
-// Неотрицательное целое: -1 = «поля нет» → NULL.
-std::string opt_i(int v) {
-    return v >= 0 ? std::to_string(v) : "NULL";
-}
-
-std::string text_or_null(const std::string& s) {
-    return s.empty() ? "NULL" : sql_quote(s);
-}
-
-// Значения одной строки предмета (без uid/индексов): для player_items и
-// entity_items колонки совпадают.
-std::string item_values(const ItemRow& it) {
-    return std::format("{},{},{},{},{},{},{},{},{},{},{},{}",
-                       std::to_string(it.parent), text_or_null(it.slot),
-                       sql_quote(it.type), f(it.health), opt_f(it.quantity),
-                       opt_i(it.ammo), opt_i(it.liquid_type), opt_f(it.liquid_vol),
-                       opt_i(it.food_stage), opt_f(it.wetness), f(it.temperature),
-                       text_or_null(it.extra));
-}
-
-constexpr int kChunk = 128;   // строк на INSERT-пачку
-
-std::vector<std::string> player_statements(const PlayerSnap& p) {
-    std::vector<std::string> out;
-    out.push_back("START TRANSACTION");
-    out.push_back("DELETE FROM players WHERE uid=" + sql_quote(p.uid));
-    out.push_back(std::format(
-        "INSERT INTO players(uid,name,alive,x,y,z,yaw,health,blood,water,energy,"
-        "lastseen,created) VALUES ({},{},{},{},{},{},{},{},{},{},{},NOW(),NOW())",
-        sql_quote(p.uid), sql_quote(p.name), std::to_string(p.alive), f(p.x),
-        f(p.y), f(p.z), f(p.yaw), f(p.health), f(p.blood), f(p.water),
-        f(p.energy)));
-    out.push_back("DELETE FROM player_items WHERE uid=" + sql_quote(p.uid));
-    for (std::size_t i = 0; i < p.items.size(); i += kChunk) {
-        std::string ins =
-            "INSERT INTO player_items(uid,idx,parent_idx,slot,type,health,"
-            "quantity,ammo,liquid_type,liquid_vol,food_stage,wetness,temperature,"
-            "extra) VALUES ";
-        for (std::size_t j = i; j < p.items.size() && j < i + kChunk; ++j)
-            ins += std::format("({},{},{})", sql_quote(p.uid), j + 1,
-                               item_values(p.items[j])) +
-                   (j + 1 < p.items.size() && j + 1 < i + kChunk ? "," : "");
-        out.push_back(std::move(ins));
-    }
-    out.push_back("COMMIT");
-    return out;
-}
-
-std::vector<std::string> world_statements(const WorldSnap& w) {
-    std::vector<std::string> out;
-    out.push_back("START TRANSACTION");
-    out.push_back("DELETE FROM world_entities WHERE layer=" + sql_quote(w.layer));
-    for (std::size_t i = 0; i < w.entities.size(); i += kChunk) {
-        std::string ins =
-            "INSERT INTO world_entities(layer,idx,type,x,y,z,yaw,pitch,roll,"
-            "health,updated) VALUES ";
-        for (std::size_t j = i; j < w.entities.size() && j < i + kChunk; ++j) {
-            const auto& e = w.entities[j];
-            ins += std::format("({},{},{},{},{},{},{},{},{},{},NOW())",
-                               sql_quote(w.layer), j + 1, sql_quote(e.type),
-                               f(e.x), f(e.y), f(e.z), f(e.yaw), f(e.pitch),
-                               f(e.roll), f(e.health)) +
-                   (j + 1 < w.entities.size() && j + 1 < i + kChunk ? "," : "");
-        }
-        out.push_back(std::move(ins));
-    }
-    for (std::size_t i = 0; i < w.entities.size(); i += kChunk) {
-        // предметы всех сущностей пачки — отдельными INSERT на сущность
-        for (std::size_t j = i; j < w.entities.size() && j < i + kChunk; ++j) {
-            const auto& items = w.entities[j].items;
-            if (items.empty())
-                continue;
-            std::string ins =
-                "INSERT INTO entity_items(layer,entity_idx,idx,parent_idx,slot,"
-                "type,health,quantity,ammo,liquid_type,liquid_vol,food_stage,"
-                "wetness,temperature,extra) VALUES ";
-            for (std::size_t k = 0; k < items.size(); ++k)
-                ins += std::format("({},{},{},{})", sql_quote(w.layer), j + 1,
-                                   k + 1, item_values(items[k])) +
-                       (k + 1 < items.size() ? "," : "");
-            out.push_back(std::move(ins));
-        }
-    }
-    out.push_back("COMMIT");
-    return out;
+bool is_corruption(const sql::Error& e) {
+    return e.code == sql::kCorrupt || e.code == sql::kNotADb;
 }
 
 }  // namespace
 
-// ── staging: сим-поток ───────────────────────────────────────────────────────
+// ── открытие ─────────────────────────────────────────────────────────────────
 
-std::string Store::check_item(const ItemRow& row) const {
-    if (row.parent < 0)
-        return "ERROR: item parent < 0";
-    if (!valid_type_name(row.type))
-        return "ERROR: bad type name '" + row.type + "'";
-    if (!valid_slot(row.slot))
-        return "ERROR: bad slot";
-    if (!valid_text(row.extra, 4096))
-        return "ERROR: bad extra";
-    return "";
-}
-
-std::string Store::player_begin(std::string_view uid, std::string_view name,
-                                int alive, float x, float y, float z, float yaw,
-                                float health, float blood, float water,
-                                float energy) {
-    if (!valid_uid(uid))
-        return "ERROR: bad uid '" + std::string(uid) + "'";
-    if (!valid_text(name, 64))
-        return "ERROR: bad player name";
-    const std::array<float, 8> coords = {x, y, z, yaw, health, blood, water,
-                                         energy};
-    for (const float v : coords)
-        if (!std::isfinite(v))
-            return "ERROR: non-finite player scalar";
-    std::lock_guard<std::mutex> lk(mx_);
-    player_stage_.emplace();
-    player_stage_->uid = uid;
-    player_stage_->name = name;
-    player_stage_->alive = alive ? 1 : 0;
-    player_stage_->x = x;
-    player_stage_->y = y;
-    player_stage_->z = z;
-    player_stage_->yaw = yaw;
-    player_stage_->health = health;
-    player_stage_->blood = blood;
-    player_stage_->water = water;
-    player_stage_->energy = energy;
-    return "";
-}
-
-int Store::player_item(const ItemRow& row) {
-    std::lock_guard<std::mutex> lk(mx_);
-    if (!player_stage_)
-        return 0;
-    if (const std::string err = check_item(row); !err.empty()) {
-        // предмет отклонён точечно (снапшот жив): ошибка — в статистику,
-        // скрипт увидит через DbStatus и добьёт снятие повтором
-        ++stats_.item_errors;
-        stats_.last_item_error = err;
-        return 0;
+Store::Store(const fs::Path& path, Log log, bool may_replace) : log_(std::move(log)) {
+    try {
+        open(path);
+    } catch (const sql::Error& e) {
+        if (!is_corruption(e) || !may_replace)
+            throw;
+        stmts_.clear();
+        db_.reset();
+        const fs::Path moved = quarantine(path);
+        log_(std::format("база испорчена ({}), отложена как «{}», создаётся новая", e.what(),
+                         fs::to_utf8(moved.filename().wstring())));
+        quarantined_ = true;
+        open(path);
     }
-    if (static_cast<int>(player_stage_->items.size()) >= kMaxPlayerItems)
-        return 0;
-    player_stage_->items.push_back(row);
-    return static_cast<int>(player_stage_->items.size());
 }
 
-std::string Store::player_end() {
-    std::lock_guard<std::mutex> lk(mx_);
-    if (!player_stage_)
-        return "ERROR: player_end без player_begin";
-    player_q_[player_stage_->uid] = std::move(*player_stage_);
-    player_stage_.reset();
-    return "";
-}
-
-std::string Store::world_begin() {
-    std::lock_guard<std::mutex> lk(mx_);
-    world_stage_open_ = true;
-    world_stage_.clear();
-    world_handles_.clear();
-    return "";
-}
-
-std::string Store::world_mark(std::string_view layer) {
-    if (!valid_layer(layer))
-        return "ERROR: unknown layer '" + std::string(layer) + "'";
-    std::lock_guard<std::mutex> lk(mx_);
-    if (!world_stage_open_)
-        return "ERROR: world_mark без world_begin";
-    auto [it, inserted] = world_stage_.try_emplace(std::string(layer));
-    if (inserted)
-        it->second.layer = layer;
-    return "";
-}
-
-int Store::world_entity(std::string_view layer, std::string_view type, float x,
-                        float y, float z, float yaw, float pitch, float roll,
-                        float health) {
-    if (!valid_layer(layer) || !valid_type_name(type))
-        return 0;
-    const std::array<float, 7> coords = {x, y, z, yaw, pitch, roll, health};
-    for (const float v : coords)
-        if (!std::isfinite(v))
-            return 0;
-    std::lock_guard<std::mutex> lk(mx_);
-    if (!world_stage_open_)
-        return 0;
-    auto& snap = world_stage_[std::string(layer)];
-    snap.layer = layer;
-    if (static_cast<int>(snap.entities.size()) >= kMaxEntities)
-        return 0;
-    snap.entities.push_back(
-        {std::string(type), x, y, z, yaw, pitch, roll, health, {}});
-    world_handles_.emplace_back(layer,
-                                static_cast<int>(snap.entities.size()));
-    return static_cast<int>(world_handles_.size());
-}
-
-int Store::world_item(int handle, const ItemRow& row) {
-    std::lock_guard<std::mutex> lk(mx_);
-    if (!world_stage_open_ || handle < 1 ||
-        handle > static_cast<int>(world_handles_.size()))
-        return 0;
-    if (const std::string err = check_item(row); !err.empty()) {
-        ++stats_.item_errors;
-        stats_.last_item_error = err;
-        return 0;
+fs::Path Store::quarantine(const fs::Path& path) {
+    const std::wstring suffix = L".corrupt-" + std::to_wstring(fs::unix_ms());
+    fs::Path moved;
+    for (const wchar_t* tail : {L"", L"-wal", L"-shm"}) {
+        fs::Path from = path;
+        from += tail;
+        fs::Path to = path;
+        to += suffix;
+        to += tail;
+        std::error_code ec;
+        std::filesystem::rename(from, to, ec);
+        if (!ec && !*tail)
+            moved = to;
     }
-    const auto& [layer, idx] = world_handles_[handle - 1];
-    auto& items = world_stage_.at(layer).entities[idx - 1].items;
-    if (static_cast<int>(items.size()) >= kMaxWorldItems)
-        return 0;
-    items.push_back(row);
-    return static_cast<int>(items.size());
+    return moved;
 }
 
-std::string Store::world_end() {
-    std::lock_guard<std::mutex> lk(mx_);
-    if (!world_stage_open_)
-        return "ERROR: world_end без world_begin";
-    for (auto& [layer, snap] : world_stage_)
-        world_q_[layer] = std::move(snap);
-    world_stage_open_ = false;
-    world_stage_.clear();
-    world_handles_.clear();
-    return "";
-}
+void Store::open(const fs::Path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    db_.emplace(path, sql::kReadWrite | sql::kCreate);
+    sql::Db& db = *db_;
+    db.busy_timeout(5000);
+    // Настройки из замеров (README, «Производительность»): страница 64 КБ и кэш 64 МБ
+    // дают кратный выигрыш на больших блобах. page_size действует только на новую базу.
+    db.exec("PRAGMA page_size = 65536");
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = FULL");
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA cache_size = -65536");
 
-// ── воркер ───────────────────────────────────────────────────────────────────
-
-void Store::drain(DbClient& db, std::string& report) {
-    std::map<std::string, PlayerSnap> players;
-    std::map<std::string, WorldSnap> worlds;
-    {
-        std::lock_guard<std::mutex> lk(mx_);
-        players.swap(player_q_);
-        worlds.swap(world_q_);
+    const std::int64_t app = db.scalar("PRAGMA application_id");
+    int version = static_cast<int>(db.scalar("PRAGMA user_version"));
+    if (app == 0 && db.scalar("SELECT count(*) FROM sqlite_master") == 0) {
+        db.exec(std::format("PRAGMA application_id = {}", kAppId));
+        version = 0;
+    } else if (app != kAppId) {
+        throw sql::Error(1, "файл «" + fs::to_utf8(path.wstring()) + "» — не база DP_DBStorage, не трогаю");
     }
+    if (version > kSchemaVersion)
+        throw sql::Error(1, std::format("база схемы v{} новее плагина (v{}): обновите плагин", version,
+                                        kSchemaVersion));
+    for (; version < kSchemaVersion; ++version) {
+        sql::Tx tx(db);
+        db.exec(kMigrations[version]);
+        db.exec(std::format("PRAGMA user_version = {}", version + 1));
+        tx.commit();
+    }
+    load_head();
+}
 
-    std::uint64_t ok_players = 0, ok_worlds = 0, ok_items = 0, failed = 0;
-    std::string last_error;
-    auto flush = [&](const std::vector<std::string>& stmts) {
-        for (const auto& s : stmts)
-            if (!db.exec(s)) {
-                db.exec("ROLLBACK");   // результат не важен — база могла умереть
-                last_error = db.error();
-                ++failed;
-                return false;
-            }
-        return true;
-    };
-
-    for (auto& [uid, snap] : players) {
-        const auto stmts = player_statements(snap);
-        if (flush(stmts)) {
-            ++ok_players;
-            ok_items += snap.items.size();
+void Store::load_head() {
+    files_.clear();
+    chars_.clear();
+    head_gen_ = db_->scalar("SELECT coalesce(max(gen), 0) FROM generations");
+    auto f = db_->prepare(
+        "SELECT f.path, f.gen, f.blob, f.mtime, f.fmt, f.tag, b.hash, b.size"
+        " FROM files f JOIN blobs b ON b.id = f.blob"
+        " WHERE f.gen = (SELECT max(gen) FROM files WHERE path = f.path)");
+    while (f.step()) {
+        HeadFile h;
+        h.gen = f.i64(1);
+        h.blob = f.i64(2);
+        h.mtime = f.i64(3);
+        h.fmt = f.null(4) ? -1 : f.i64(4);
+        h.tag = f.text(5);
+        const auto hash = f.blob(6);
+        if (hash.size() != h.hash.size())
+            throw sql::Error(sql::kCorrupt, "blobs.hash неверной длины");
+        std::ranges::copy(hash, h.hash.begin());
+        h.size = f.i64(7);
+        files_.emplace(f.text(0), std::move(h));
+    }
+    auto c = db_->prepare(
+        "SELECT c.uid, c.id, c.alive, c.blob, b.hash"
+        " FROM characters c LEFT JOIN blobs b ON b.id = c.blob"
+        " WHERE c.gone = 0 AND c.gen = (SELECT max(gen) FROM characters WHERE uid = c.uid)");
+    while (c.step()) {
+        HeadChar h;
+        h.id = c.i64(1);
+        h.alive = c.i64(2);
+        if (!c.null(3)) {
+            h.blob = c.i64(3);
+            const auto hash = c.blob(4);
+            if (hash.size() != h.hash.size())
+                throw sql::Error(sql::kCorrupt, "blobs.hash неверной длины");
+            std::ranges::copy(hash, h.hash.begin());
         }
+        chars_.emplace(c.text(0), h);
     }
-    for (auto& [layer, snap] : worlds) {
-        const auto stmts = world_statements(snap);
-        if (flush(stmts)) {
-            ++ok_worlds;
-            for (const auto& e : snap.entities)
-                ok_items += e.items.size();
+}
+
+sql::Stmt& Store::stmt(const char* sql) {
+    auto it = stmts_.find(sql);
+    if (it == stmts_.end())
+        it = stmts_.emplace(sql, db_->prepare(sql)).first;
+    it->second.reset();
+    return it->second;
+}
+
+// ── запись ───────────────────────────────────────────────────────────────────
+
+// Строка (ключ, поколение) пишется обычным INSERT: при включённых внешних ключах
+// INSERT OR REPLACE заводит журнал оператора и копирует в него страницы по 64 КБ — это
+// 20 мкс на строку против 1. Замена нужна только повторной записи ключа в том же
+// поколении, а такая запись всегда есть в pending.
+template <class Pending>
+const char* row_sql(const Pending& pending, const std::string& key, const char* insert, const char* replace) {
+    return pending.contains(key) ? replace : insert;
+}
+
+std::int64_t Store::blob_put(const fs::Hash& hash, std::span<const std::byte> data) {
+    auto& find = stmt("SELECT id FROM blobs WHERE hash = ?");
+    find.bind(1, std::span<const std::byte>(hash));
+    const bool found = find.step();
+    const std::int64_t id = found ? find.i64(0) : 0;
+    find.reset();
+    if (found)
+        return id;
+    auto& ins = stmt("INSERT INTO blobs(hash, size, data) VALUES(?, ?, ?)");
+    ins.bind(1, std::span<const std::byte>(hash)).bind(2, static_cast<std::int64_t>(data.size())).bind(3, data);
+    ins.step();
+    ins.reset();
+    return db_->last_rowid();
+}
+
+Store::Writer::Writer(Store& s, std::string kind, std::string build, std::string note, std::int64_t now_ms)
+    : s_(s), kind_(std::move(kind)), build_(std::move(build)), note_(std::move(note)), now_ms_(now_ms) {}
+
+void Store::Writer::open_tx() {
+    if (!tx_)
+        tx_.emplace(*s_.db_);
+}
+
+std::int64_t Store::Writer::gen() {
+    if (gen_ == 0) {
+        open_tx();
+        auto& q = s_.stmt("INSERT INTO generations(ts, kind, build, note) VALUES(?, ?, ?, ?)");
+        q.bind(1, now_ms_).bind(2, kind_).bind(3, build_).bind(4, note_);
+        q.step();
+        gen_ = s_.db_->last_rowid();
+    }
+    return gen_;
+}
+
+const HeadFile* Store::Writer::file(const std::string& path) const {
+    if (const auto it = files_.find(path); it != files_.end())
+        return it->second ? &*it->second : nullptr;
+    const auto it = s_.files_.find(path);
+    return it == s_.files_.end() ? nullptr : &it->second;
+}
+
+const HeadChar* Store::Writer::chr(const std::string& uid) const {
+    if (const auto it = chars_.find(uid); it != chars_.end())
+        return it->second ? &*it->second : nullptr;
+    const auto it = s_.chars_.find(uid);
+    return it == s_.chars_.end() ? nullptr : &it->second;
+}
+
+bool Store::Writer::put_file(std::string_view path, std::span<const std::byte> data, std::int64_t mtime,
+                             const Facts& facts) {
+    const std::string key(path);
+    const fs::Hash hash = fs::sha256(data);
+    if (const HeadFile* cur = file(key); cur && cur->hash == hash) {
+        if (cur->mtime != mtime) {
+            open_tx();
+            auto& q = s_.stmt("UPDATE files SET mtime = ? WHERE path = ? AND gen = ?");
+            q.bind(1, mtime).bind(2, key).bind(3, cur->gen);
+            q.step();
+            HeadFile touched = *cur;
+            touched.mtime = mtime;
+            files_[key] = std::move(touched);
         }
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(mx_);
-        stats_.players += ok_players;
-        stats_.worlds += ok_worlds;
-        stats_.items += ok_items;
-        stats_.failed += failed;
-        if (!last_error.empty())
-            stats_.last_error = last_error;
-    }
-    report = std::format("players={} worlds={} items={} failed={}", ok_players,
-                         ok_worlds, ok_items, failed);
-}
-
-size_t Store::pending_players() const {
-    std::lock_guard<std::mutex> lk(mx_);
-    return player_q_.size();
-}
-
-size_t Store::pending_worlds() const {
-    std::lock_guard<std::mutex> lk(mx_);
-    return world_q_.size();
-}
-
-Store::Stats Store::stats() const {
-    std::lock_guard<std::mutex> lk(mx_);
-    return stats_;
-}
-
-// ── события мира ─────────────────────────────────────────────────────────────
-
-bool Store::event_push(const EventRow& ev) {
-    if (ev.type.empty() || ev.type.size() > 32)
         return false;
-    std::lock_guard<std::mutex> lk(mx_);
-    if (event_q_.size() >= static_cast<std::size_t>(kMaxEvents)) {
-        ++stats_.events_dropped;   // шум быстрее выгрузки — теряем старьё не глядя,
-        return false;              // счётчик покажет в DbStatus
     }
-    event_q_.push_back(ev);
+    HeadFile h;
+    h.gen = gen();
+    h.blob = s_.blob_put(hash, data);
+    h.hash = hash;
+    h.size = static_cast<std::int64_t>(data.size());
+    h.mtime = mtime;
+    const bool layer = facts.shape == Shape::Complete;
+    h.fmt = layer ? facts.fmt : -1;
+    h.tag = layer ? facts.tag : std::string();
+    auto& q = s_.stmt(row_sql(files_, key,
+                              "INSERT INTO files(path, gen, blob, mtime, fmt, save, stamp, tag)"
+                              " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                              "INSERT OR REPLACE INTO files(path, gen, blob, mtime, fmt, save, stamp, tag)"
+                              " VALUES(?, ?, ?, ?, ?, ?, ?, ?)"));
+    q.bind(1, key).bind(2, h.gen).bind(3, h.blob).bind(4, mtime);
+    const auto opt = [&](int i, std::int64_t v) { layer && v >= 0 ? q.bind(i, v) : q.bind(i, nullptr); };
+    opt(5, facts.fmt);
+    opt(6, facts.save);
+    opt(7, facts.stamp);
+    layer ? q.bind(8, facts.tag) : q.bind(8, nullptr);
+    q.step();
+    files_[key] = std::move(h);
     return true;
 }
 
-void Store::events_flush(DbClient& db) {
-    std::deque<EventRow> q;
-    {
-        std::lock_guard<std::mutex> lk(mx_);
-        q.swap(event_q_);
-    }
-    constexpr std::size_t kChunk = 500;
-    std::size_t done = 0;
-    for (std::size_t i = 0; i < q.size(); i += kChunk) {
-        const std::size_t n = std::min(kChunk, q.size() - i);
-        std::string ins =
-            "INSERT INTO world_events(type, uid, etype, x, y, z, payload)"
-            " VALUES ";
-        for (std::size_t j = i; j < i + n; ++j) {
-            const auto& e = q[j];
-            ins += std::format("({},{},{},{},{},{},{}){}", sql_quote(e.type),
-                               e.uid.empty() ? "NULL" : sql_quote(e.uid),
-                               e.etype.empty() ? "NULL" : sql_quote(e.etype),
-                               f(e.x), f(e.y), f(e.z),
-                               e.payload.empty() ? "NULL" : sql_quote(e.payload),
-                               j + 1 < i + n ? "," : "");
-        }
-        if (!db.exec(ins))
-            break;   // СУБД умерла: несброшенный хвост вернётся в буфер
-        done += n;
-    }
-    std::lock_guard<std::mutex> lk(mx_);
-    stats_.events += done;
-    if (done < q.size()) {
-        // порядок сохраняем: голова буфера — самое старое из невыгруженного
-        event_q_.insert(event_q_.begin(), q.begin() + static_cast<long>(done),
-                        q.end());
-        // и не копим сверх капа
-        while (event_q_.size() > static_cast<std::size_t>(kMaxEvents)) {
-            event_q_.pop_front();
-            ++stats_.events_dropped;
-        }
-    }
+void Store::Writer::del_file(std::string_view path) {
+    const std::string key(path);
+    if (!file(key))
+        return;
+    auto& q = s_.stmt(row_sql(files_, key, "INSERT INTO files(path, gen, blob) VALUES(?, ?, NULL)",
+                              "INSERT OR REPLACE INTO files(path, gen, blob) VALUES(?, ?, NULL)"));
+    q.bind(1, key).bind(2, gen());
+    q.step();
+    files_[key] = std::nullopt;
 }
 
-size_t Store::events_pending() const {
-    std::lock_guard<std::mutex> lk(mx_);
-    return event_q_.size();
+bool Store::Writer::put_char(std::string_view uid, std::int64_t id, std::int64_t alive, const fs::Bytes* data) {
+    const std::string key(uid);
+    const fs::Hash hash = data ? fs::sha256(*data) : fs::Hash{};
+    if (const HeadChar* cur = chr(key);
+        cur && cur->id == id && cur->alive == alive && (data ? cur->blob != 0 && cur->hash == hash : cur->blob == 0))
+        return false;
+    HeadChar h;
+    h.id = id;
+    h.alive = alive;
+    const std::int64_t g = gen();
+    if (data) {
+        h.blob = s_.blob_put(hash, *data);
+        h.hash = hash;
+    }
+    auto& q = s_.stmt(row_sql(chars_, key,
+                              "INSERT INTO characters(uid, gen, id, alive, blob, gone) VALUES(?, ?, ?, ?, ?, 0)",
+                              "INSERT OR REPLACE INTO characters(uid, gen, id, alive, blob, gone) VALUES(?, ?, ?, ?, ?, 0)"));
+    q.bind(1, key).bind(2, g).bind(3, id).bind(4, alive);
+    data ? q.bind(5, h.blob) : q.bind(5, nullptr);
+    q.step();
+    chars_[key] = h;
+    return true;
 }
 
-Store& store() {
-    static Store s;
-    return s;
+void Store::Writer::del_char(std::string_view uid) {
+    const std::string key(uid);
+    if (!chr(key))
+        return;
+    auto& q = s_.stmt(row_sql(chars_, key, "INSERT INTO characters(uid, gen, gone) VALUES(?, ?, 1)",
+                              "INSERT OR REPLACE INTO characters(uid, gen, gone) VALUES(?, ?, 1)"));
+    q.bind(1, key).bind(2, gen());
+    q.step();
+    chars_[key] = std::nullopt;
+}
+
+std::int64_t Store::Writer::commit() {
+    if (!tx_)
+        return 0;
+    tx_->commit();
+    tx_.reset();
+    for (auto& [path, h] : files_)
+        h ? void(s_.files_[path] = std::move(*h)) : void(s_.files_.erase(path));
+    for (auto& [uid, h] : chars_)
+        h ? void(s_.chars_[uid] = *h) : void(s_.chars_.erase(uid));
+    files_.clear();
+    chars_.clear();
+    if (gen_)
+        s_.head_gen_ = gen_;
+    return std::exchange(gen_, 0);
+}
+
+// ── чтение ───────────────────────────────────────────────────────────────────
+
+fs::Bytes Store::blob(std::int64_t id) {
+    auto& q = stmt("SELECT hash, data FROM blobs WHERE id = ?");
+    q.bind(1, id);
+    if (!q.step())
+        throw sql::Error(sql::kCorrupt, std::format("блоб {} отсутствует", id));
+    const auto hash = q.blob(0);
+    const auto data = q.blob(1);
+    fs::Bytes out(data.begin(), data.end());
+    const bool ok = std::ranges::equal(hash, fs::sha256(out));
+    q.reset();
+    if (!ok)
+        throw sql::Error(sql::kCorrupt, std::format("блоб {} повреждён: хеш не сходится", id));
+    return out;
+}
+
+State Store::state(std::int64_t gen) {
+    State st;
+    auto f = db_->prepare("SELECT path, blob FROM files f WHERE blob IS NOT NULL"
+                          " AND gen = (SELECT max(gen) FROM files WHERE path = f.path AND gen <= ?1)");
+    f.bind(1, gen);
+    while (f.step())
+        st.files.emplace(f.text(0), f.i64(1));
+    auto c = db_->prepare("SELECT uid, id, alive, coalesce(blob, 0) FROM characters c WHERE gone = 0"
+                          " AND gen = (SELECT max(gen) FROM characters WHERE uid = c.uid AND gen <= ?1)"
+                          " ORDER BY id");
+    c.bind(1, gen);
+    while (c.step())
+        st.chars.push_back({c.text(0), c.i64(1), c.i64(2), c.i64(3)});
+    return st;
+}
+
+std::vector<GenInfo> Store::generations(int limit) {
+    std::vector<GenInfo> out;
+    auto q = db_->prepare("SELECT g.gen, g.ts, g.kind, g.build, g.note, g.pinned,"
+                          " (SELECT count(*) FROM files f WHERE f.gen = g.gen),"
+                          " (SELECT count(*) FROM characters c WHERE c.gen = g.gen)"
+                          " FROM generations g ORDER BY g.gen DESC LIMIT ?");
+    q.bind(1, std::int64_t{limit > 0 ? limit : -1});
+    while (q.step())
+        out.push_back({q.i64(0), q.i64(1), q.text(2), q.text(3), q.text(4), q.i64(5) != 0, q.i64(6), q.i64(7)});
+    return out;
+}
+
+void Store::pin(std::int64_t gen, bool pinned, std::string_view note) {
+    auto q = db_->prepare("UPDATE generations SET pinned = ?, note = CASE WHEN ?2 = '' THEN note ELSE ?2 END"
+                          " WHERE gen = ?3");
+    q.bind(1, std::int64_t{pinned}).bind(2, note).bind(3, gen);
+    q.step();
+    if (db_->changes() == 0)
+        throw sql::Error(1, std::format("поколения {} нет", gen));
+}
+
+bool Store::restorable(std::int64_t gen) {
+    auto q = db_->prepare("SELECT pinned FROM generations WHERE gen = ?");
+    q.bind(1, gen);
+    if (!q.step())
+        return false;
+    const std::string floor = meta("floor");
+    return q.i64(0) != 0 || gen >= (floor.empty() ? 0 : std::stoll(floor));
+}
+
+std::string Store::meta(std::string_view key) {
+    auto q = db_->prepare("SELECT v FROM meta WHERE k = ?");
+    q.bind(1, key);
+    return q.step() ? q.text(0) : std::string();
+}
+
+void Store::set_meta(std::string_view key, std::string_view value) {
+    auto q = db_->prepare("INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)");
+    q.bind(1, key).bind(2, value);
+    q.step();
+}
+
+// ── удержание ────────────────────────────────────────────────────────────────
+
+std::int64_t Store::used_bytes() {
+    return (db_->scalar("PRAGMA page_count") - db_->scalar("PRAGMA freelist_count")) * db_->scalar("PRAGMA page_size");
+}
+
+// Версия нужна, пока она «последняя на момент» хотя бы одной точки, которую мы обязаны
+// уметь восстановить: любого поколения >= cutoff и любого закреплённого. Значит, удалить
+// её можно, когда следующая версия того же пути появилась не позже cutoff и между ними
+// нет закреплённого поколения.
+void Store::squash(std::int64_t cutoff, RetentionReport& r) {
+    sql::Tx tx(*db_);
+    for (const auto& [table, key, dead] : {std::tuple{"files", "path", "blob IS NULL"},
+                                           std::tuple{"characters", "uid", "gone = 1"}}) {
+        auto superseded = db_->prepare(std::format(
+            "DELETE FROM {0} WHERE gen < ?1 AND EXISTS (SELECT 1 FROM {0} n WHERE n.{1} = {0}.{1}"
+            " AND n.gen > {0}.gen AND n.gen <= ?1 AND NOT EXISTS (SELECT 1 FROM generations p"
+            " WHERE p.pinned = 1 AND p.gen >= {0}.gen AND p.gen < n.gen))",
+            table, key));
+        superseded.bind(1, cutoff);
+        superseded.step();
+        r.versions += db_->changes();
+        // Отметка об удалении, за которой ничего не осталось, уже ничего не сообщает.
+        auto tombstones = db_->prepare(std::format(
+            "DELETE FROM {0} WHERE {2} AND gen <= ?1"
+            " AND NOT EXISTS (SELECT 1 FROM {0} o WHERE o.{1} = {0}.{1} AND o.gen < {0}.gen)",
+            table, key, dead));
+        tombstones.bind(1, cutoff);
+        tombstones.step();
+        r.versions += db_->changes();
+    }
+    db_->exec("DELETE FROM blobs WHERE NOT EXISTS (SELECT 1 FROM files WHERE blob = blobs.id)"
+              " AND NOT EXISTS (SELECT 1 FROM characters WHERE blob = blobs.id)");
+    r.blobs += db_->changes();
+    auto gens = db_->prepare("DELETE FROM generations WHERE gen < ?1 AND pinned = 0"
+                             " AND NOT EXISTS (SELECT 1 FROM files WHERE gen = generations.gen)"
+                             " AND NOT EXISTS (SELECT 1 FROM characters WHERE gen = generations.gen)");
+    gens.bind(1, cutoff);
+    gens.step();
+    r.generations += db_->changes();
+    // Ниже границы история неполна: откат туда возможен только на закреплённые поколения.
+    auto floor = db_->prepare("INSERT OR REPLACE INTO meta(k, v) VALUES('floor', ?)");
+    floor.bind(1, std::to_string(cutoff));
+    floor.step();
+    tx.commit();
+    r.cutoff = cutoff;
+}
+
+RetentionReport Store::retain(std::int64_t now_ms, int keep_hours, std::int64_t max_bytes) {
+    RetentionReport r;
+    stmts_.clear();   // открытые курсоры кэша не должны мешать контрольной точке
+    auto q = db_->prepare("SELECT coalesce(max(gen), 0) FROM generations WHERE ts <= ?");
+    q.bind(1, now_ms - std::int64_t{keep_hours} * 3'600'000);
+    q.step();
+    std::int64_t cutoff = q.i64(0);
+    q.reset();
+    if (cutoff > 0)
+        squash(cutoff, r);
+    // Диск не резиновый: если окно по времени не уложилось в лимит — режем окно пополам,
+    // пока не уложится или не останется одна голова.
+    while (used_bytes() > max_bytes && cutoff < head_gen_) {
+        cutoff += std::max<std::int64_t>(1, (head_gen_ - cutoff + 1) / 2);
+        squash(cutoff, r);
+    }
+    if (r.versions || r.blobs) {
+        try {
+            db_->exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        } catch (const sql::Error& e) {
+            log_(std::format("контрольная точка WAL не прошла: {}", e.what()));
+        }
+    }
+    return r;
+}
+
+VerifyReport Store::verify() {
+    VerifyReport v;
+    for (const char* check : {"PRAGMA integrity_check", "PRAGMA foreign_key_check"}) {
+        auto q = db_->prepare(check);
+        while (q.step())
+            if (const std::string row = q.text(0); row != "ok")
+                v.problems.push_back(std::string(check) + ": " + row);
+    }
+    auto q = db_->prepare("SELECT id, hash, size, data FROM blobs");
+    while (q.step()) {
+        ++v.blobs;
+        const auto data = q.blob(3);
+        if (static_cast<std::int64_t>(data.size()) != q.i64(2) || !std::ranges::equal(q.blob(1), fs::sha256(data)))
+            v.problems.push_back(std::format("блоб {}: содержимое не соответствует хешу", q.i64(0)));
+    }
+    return v;
 }
 
 }  // namespace dpdb

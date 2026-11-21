@@ -1,6 +1,6 @@
 // DP_DBStorage_Server — PBO-часть graft-мода DP_DBStorage.
-// Скрипты вызывают нативы плагина DP_DBStorage.grafted.dll; без ядра GRAFT весь
-// код под #ifdef GRAFTED_DP_DBStorage и мод компилируется пустым (совместимость).
+// Своих скриптов у мода нет: PBO несёт только объявление натива DbStatus(), которое
+// печатает сборка плагина. Без ядра GRAFT объявление скрыто под #ifdef.
 
 class CfgPatches
 {
@@ -26,7 +26,7 @@ class CfgMods
 		credits = "DarkProject";
 		author = "DarkProject";
 		authorID = "0";
-		version = "0.1.0";
+		version = "2.0.0";
 		extra = 0;
 		type = "servermod";                // только сервер, клиентам не уходит
 
@@ -34,24 +34,10 @@ class CfgMods
 
 		class defs
 		{
-			// сюда graft генерирует объявления нативов (3_Game).
 			class gameScriptModule
 			{
 				value = "";
 				files[] = { "DP_DBStorage_Server/scripts/3_Game" };
-			};
-			// моддинг классов мира (ItemBase/PlayerBase/зомби/животные):
-			// entity-классы живут в 4_World, модить их можно только из него.
-			class worldScriptModule
-			{
-				value = "";
-				files[] = { "DP_DBStorage_Server/scripts/4_World" };
-			};
-			// вызовы: сохранение/восстановление, self-test миссии.
-			class missionScriptModule
-			{
-				value = "";
-				files[] = { "DP_DBStorage_Server/scripts/5_Mission" };
 			};
 		};
 	};

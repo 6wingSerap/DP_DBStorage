@@ -1,111 +1,151 @@
-// Очередь снапшотов: staging нативов (сим-поток) → coalesce по uid/слою →
-// SQL-воркер. Снапшот = полная замена (DELETE+INSERT в транзакции): просто,
-// безопасно, не копит расхождения с базой.
+// База плагина: поколения, содержимое файлов (дедуп по SHA-256), персонажи, удержание.
+//
+// Модель: байты движка хранятся как есть. Каждая запись изменений — поколение; версия
+// файла/персонажа принадлежит поколению, в котором появилась. Состояние на поколение G —
+// последняя версия каждого пути с gen <= G. «Голова» — состояние на последнее поколение,
+// держится в памяти.
 #pragma once
 #include <cstdint>
-#include <deque>
+#include <functional>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "db.hpp"
+#include "format.hpp"
+#include "fs.hpp"
+#include "sqlite.hpp"
 
 namespace dpdb {
 
-inline constexpr int kMaxPlayerItems = 4096;    // предметов на снапшот игрока
-inline constexpr int kMaxWorldItems = 512;      // предметов на сущность мира
-inline constexpr int kMaxEntities = 200000;     // сущностей на слой
-inline constexpr int kMaxEvents = 65536;        // событий в буфере (дроп-старше)
+using Log = std::function<void(std::string_view)>;
 
-// Предмет: узел дерева инвентаря. Отрицательные int/float = «нет» → NULL.
-struct ItemRow {
-    int parent = 0;                 // 0 = корень (слот самой сущности/игрока)
-    std::string slot, type, extra;  // extra — длинный хвост, TEXT
-    float health = 0, quantity = -1, liquid_vol = -1, wetness = 0, temperature = 0;
-    int ammo = -1, liquid_type = -1, food_stage = -1;
+// Виртуальные пути в files: у настоящих файлов двоеточия в относительном пути не бывает.
+inline constexpr std::string_view kPlayersFile = "players.db";            // весь файл (запасной режим)
+inline constexpr std::string_view kPlayersSchema = "players.db:schema";   // SQL-скрипт схемы движка
+
+struct HeadFile {
+    std::int64_t blob = 0, size = 0, mtime = 0, gen = 0;
+    fs::Hash hash{};
+    std::int64_t fmt = -1;   // версия формата слоя; -1 — не слой CE
+    std::string tag;
 };
 
-struct PlayerSnap {
-    std::string uid, name;
-    int alive = 1;
-    float x = 0, y = 0, z = 0, yaw = 0;
-    float health = 0, blood = 0, water = 0, energy = 0;
-    std::vector<ItemRow> items;
+struct HeadChar {
+    std::int64_t id = 0, alive = 0;
+    std::int64_t blob = 0;   // 0 — Data NULL
+    fs::Hash hash{};
 };
 
-struct EntitySnap {
-    std::string type;
-    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, roll = 0, health = 0;
-    std::vector<ItemRow> items;
+struct GenInfo {
+    std::int64_t gen = 0, ts = 0;   // ts — unix, мс
+    std::string kind, build, note;
+    bool pinned = false;
+    std::int64_t files = 0, chars = 0;   // версий в поколении
 };
 
-struct WorldSnap {
-    std::string layer;
-    std::vector<EntitySnap> entities;
+struct State {
+    struct Char {
+        std::string uid;
+        std::int64_t id = 0, alive = 0, blob = 0;
+    };
+    std::map<std::string, std::int64_t> files;   // путь → blob
+    std::vector<Char> chars;
+};
+
+struct RetentionReport {
+    std::int64_t cutoff = 0, versions = 0, blobs = 0, generations = 0;
+};
+
+struct VerifyReport {
+    std::int64_t blobs = 0;
+    std::vector<std::string> problems;
 };
 
 class Store {
 public:
-    // ── сим-поток: staging нативов. "" = ок, "ERROR: …" — скрипту в лог ────
-    std::string player_begin(std::string_view uid, std::string_view name,
-                             int alive, float x, float y, float z, float yaw,
-                             float health, float blood, float water,
-                             float energy);
-    int player_item(const ItemRow& row);   // 1-основанный индекс, 0 = отказ
-    std::string player_end();
+    // Открыть или создать. Испорченный файл откладывается в сторону (*.corrupt-<время>) и
+    // создаётся новая база: рабочая копия мира лежит на диске, теряется только история.
+    // Так поступает только хозяин базы (may_replace); читающий рядом получает исключение.
+    // Чужой SQLite-файл и база более новой схемы — исключение, файл не трогается.
+    Store(const fs::Path& path, Log log, bool may_replace = true);
 
-    std::string world_begin();              // одна сессия — все слои сразу
-    std::string world_mark(std::string_view layer);   // слой с 0 сущностей (явная пустота)
-    int world_entity(std::string_view layer, std::string_view type, float x,
-                     float y, float z, float yaw, float pitch, float roll,
-                     float health);        // сквозной handle для world_item
-    int world_item(int handle, const ItemRow& row);
-    std::string world_end();               // все отмеченные слои → очередь
+    // Отложить файл базы (и её -wal/-shm) в сторону. Возвращает новое имя или пусто.
+    static fs::Path quarantine(const fs::Path& path);
 
-    // ── воркер ──────────────────────────────────────────────────────────────
-    void drain(DbClient& db, std::string& report);
-    size_t pending_players() const;
-    size_t pending_worlds() const;
+    // Одна транзакция = не более одного поколения. Поколение заводится на первой
+    // настоящей версии; без commit() всё откатывается и голова не меняется.
+    class Writer {
+    public:
+        Writer(Store& s, std::string kind, std::string build, std::string note, std::int64_t now_ms);
+        Writer(const Writer&) = delete;
+        Writer& operator=(const Writer&) = delete;
 
-    // ── события мира ───────────────────────────────────────────────────────
-    // Сим-поток толкает события (true = принято; false = буфер полон —
-    // событие потеряно, счётчик дропа растёт). Воркер выгружает пачками.
-    struct EventRow {
-        std::string type, uid, etype, payload;
-        float x = 0, y = 0, z = 0;
+        // false — содержимое совпало с головой (обновлён только mtime-ускоритель).
+        bool put_file(std::string_view path, std::span<const std::byte> data, std::int64_t mtime, const Facts& facts);
+        void del_file(std::string_view path);
+        // data == nullptr — Data NULL. false — персонаж не изменился.
+        bool put_char(std::string_view uid, std::int64_t id, std::int64_t alive, const fs::Bytes* data);
+        void del_char(std::string_view uid);
+        std::int64_t commit();   // номер поколения; 0 — версий не добавилось
+
+    private:
+        void open_tx();
+        std::int64_t gen();
+        const HeadFile* file(const std::string& path) const;
+        const HeadChar* chr(const std::string& uid) const;
+        Store& s_;
+        std::string kind_, build_, note_;
+        std::int64_t now_ms_;
+        std::optional<sql::Tx> tx_;
+        std::int64_t gen_ = 0;
+        std::map<std::string, std::optional<HeadFile>> files_;   // nullopt — удалён
+        std::map<std::string, std::optional<HeadChar>> chars_;
     };
-    bool event_push(const EventRow& ev);
-    void events_flush(DbClient& db);
-    size_t events_pending() const;
 
-    struct Stats {
-        std::uint64_t players = 0, worlds = 0, items = 0, failed = 0;
-        std::uint64_t item_errors = 0;   // предметы, отклонённые валидацией
-        std::string last_error;          // последняя ошибка записи
-        std::string last_item_error;     // последний отклонённый предмет
-        std::uint64_t events = 0;        // событий записано в СУБД
-        std::uint64_t events_dropped = 0;   // не влезло в буфер
-    };
-    Stats stats() const;
+    Writer begin(std::string kind, std::string build = {}, std::string note = {},
+                 std::int64_t now_ms = fs::unix_ms()) {
+        return Writer(*this, std::move(kind), std::move(build), std::move(note), now_ms);
+    }
+
+    const std::map<std::string, HeadFile>& files() const { return files_; }
+    const std::map<std::string, HeadChar>& chars() const { return chars_; }
+    std::int64_t head_gen() const { return head_gen_; }
+    bool was_quarantined() const { return quarantined_; }
+
+    fs::Bytes blob(std::int64_t id);   // хеш сверяется; расхождение — sql::Error(kCorrupt)
+    State state(std::int64_t gen);
+    std::vector<GenInfo> generations(int limit = 0);   // новые сверху
+    void pin(std::int64_t gen, bool pinned, std::string_view note);
+    // Состояние на это поколение ещё восстановимо точно: оно закреплено или не старше
+    // границы, до которой удержание схлопнуло историю.
+    bool restorable(std::int64_t gen);
+
+    // Схлопнуть историю старше keep_hours, а если база всё ещё больше max_bytes — и более
+    // свежую, вплоть до одной головы. Закреплённые поколения сохраняются всегда.
+    RetentionReport retain(std::int64_t now_ms, int keep_hours, std::int64_t max_bytes);
+    VerifyReport verify();
+    std::int64_t used_bytes();
+
+    std::string meta(std::string_view key);
+    void set_meta(std::string_view key, std::string_view value);
+    sql::Db& db() { return *db_; }
 
 private:
-    std::string check_item(const ItemRow& row) const;
+    void open(const fs::Path& path);
+    void load_head();
+    void squash(std::int64_t cutoff, RetentionReport& r);
+    std::int64_t blob_put(const fs::Hash& hash, std::span<const std::byte> data);
+    sql::Stmt& stmt(const char* sql);
 
-    mutable std::mutex mx_;
-    std::optional<PlayerSnap> player_stage_;
-    bool world_stage_open_ = false;
-    std::map<std::string, WorldSnap> world_stage_;   // слой → снапшот в сборе
-    std::vector<std::pair<std::string, int>> world_handles_;  // handle → (слой, idx)
-    std::map<std::string, PlayerSnap> player_q_;   // coalesce: последний uid
-    std::map<std::string, WorldSnap> world_q_;     // coalesce: последний слой
-    std::deque<EventRow> event_q_;                 // буфер событий мира
-    Stats stats_;
+    Log log_;
+    std::optional<sql::Db> db_;
+    std::map<const char*, sql::Stmt> stmts_;   // ключ — адрес литерала
+    std::map<std::string, HeadFile> files_;
+    std::map<std::string, HeadChar> chars_;
+    std::int64_t head_gen_ = 0;
+    bool quarantined_ = false;
 };
-
-// Глобальный стор плагина (нативы и воркер).
-Store& store();
 
 }  // namespace dpdb

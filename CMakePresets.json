@@ -1,9 +1,6 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": {
-    "major": 3,
-    "minor": 30
-  },
+  "cmakeMinimumRequired": { "major": 3, "minor": 30 },
   "configurePresets": [
     {
       "name": "base",
@@ -20,42 +17,33 @@
     },
     {
       "name": "release",
-      "displayName": "Release",
+      "displayName": "Release: плагин + dpdb.exe",
       "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
-      }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
       "name": "debug",
       "displayName": "Debug",
       "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
-      }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
       "name": "tests",
-      "displayName": "Tests (gtest, без игры)",
+      "displayName": "Тесты (gtest, без игры и без graft)",
       "inherits": "base",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "DPDB_BUILD_PLUGIN": "OFF",
         "DPDB_BUILD_TESTS": "ON"
       }
     }
   ],
   "buildPresets": [
-    {
-      "name": "release",
-      "configurePreset": "release"
-    },
-    {
-      "name": "debug",
-      "configurePreset": "debug"
-    },
-    {
-      "name": "tests",
-      "configurePreset": "tests"
-    }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "tests", "configurePreset": "tests" }
+  ],
+  "testPresets": [
+    { "name": "tests", "configurePreset": "tests", "output": { "outputOnFailure": true } }
   ]
 }

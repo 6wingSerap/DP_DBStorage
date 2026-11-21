@@ -1,78 +1,45 @@
-// Восстановление: воркер заранее читает снапшоты слоёв и игроков из MariaDB в
-// кэш, нативы отдают строки скрипту без сети на сим-потоке. Игрок — по запросу
-// (очередь к воркеру, скрипт опрашивает готовность).
+// База → диск. Правило старта: что есть на диске и цело — главнее базы (его заберёт
+// sync); база закрывает дыры (пропавшие файлы) и заменяет оборванные слои. Ни один
+// файл не пишется под настоящим именем наполовину, и ни один блоб — без сверки хеша.
+//
+// shortcut: «файла нет» на старте всегда читается как потеря, поэтому удалённое при
+// остановленном сервере или в последнюю секунду перед выходом вернётся из базы (вайп —
+// только через dpdb wipe). Различать — журналом удалений из перехвата DeleteFileW; нужно,
+// когда появится мод, которому воскресший файл вреден.
 #pragma once
-#include <cstdint>
-#include <map>
-#include <mutex>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
-
-#include "db.hpp"
+#include "players.hpp"
 #include "store.hpp"
+#include "sync.hpp"
 
 namespace dpdb {
 
-struct RestoredItem {
-    int parent = 0;
-    std::string slot, type, extra;
-    float health = 0, quantity = -1, liquid_vol = -1, wetness = 0, temperature = 0;
-    int ammo = -1, liquid_type = -1, food_stage = -1;
+struct RestoreReport {
+    int restored = 0;   // записано отсутствовавших файлов
+    int repaired = 0;   // оборванных слоёв заменено целой версией
+    int removed = 0;    // лишних файлов удалено (только materialize)
+    int failed = 0;
+    bool players = false;   // players.db собран заново
 };
 
-struct RestoredEntity {
-    std::string type;
-    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, roll = 0, health = 0;
-    std::vector<RestoredItem> items;
-};
+// Старт сервера, после прохода sync. skip — вердикты этого прохода: оборванные слои
+// известны из него, заново диск не читается. players — состояние players.db, которое
+// вызывающий уже выяснил (check_players — это чтение всего файла, второй раз оно не нужно).
+// Испорченный players.db не удаляется, а переносится в quarantine_dir.
+//
+// Оборванный слой заменяется, только если в голове лежит целая версия того же пути с тем
+// же тегом и той же версией формата: тогда разбор заголовка этой версии уже подтверждён
+// настоящим файлом. Иначе (формат сменился патчем) файл остаётся как есть. Пустышка на
+// месте слоя заменяется всегда: она от формата не зависит.
+RestoreReport repair(Store& store, const fs::Path& root, const SkipCache& skip, PlayersHealth players,
+                     const fs::Path& quarantine_dir, const Log& log);
 
-struct RestoredPlayer {
-    std::string uid, name;
-    int alive = 1;
-    float x = 0, y = 0, z = 0, yaw = 0;
-    float health = 0, blood = 0, water = -1, energy = -1;
-    std::vector<RestoredItem> items;
-};
+// Привести каталог точно к состоянию поколения: записать его файлы, лишние удалить,
+// players.db собрать. Сначала сверяются все блобы: при порче не меняется ничего.
+// Только при остановленном сервере.
+RestoreReport materialize(Store& store, std::int64_t gen, const fs::Path& dir, const Log& log);
 
-// Упаковка строки в TAB-разделённую строку для Enforce (Split("\t")).
-std::string pack_entity(const RestoredEntity& e);
-std::string pack_item(const RestoredItem& it);
-std::string pack_player(const RestoredPlayer& p);
-
-class Restore {
-public:
-    // ── воркер ──
-    // Загрузить слой целиком (сущности + предметы). false — ошибка СУБД.
-    bool load_layer(DbClient& db, std::string_view layer, std::string& err);
-    // Загрузить игрока по uid; 0 — нет такого, -1 — ошибка СУБД, 1 — готово.
-    int load_player(DbClient& db, std::string_view uid, std::string& err);
-    // Сколько слоёв в кэше.
-    size_t cached_layers() const;
-
-    // ── сим-поток (нативы) ──
-    bool ready() const;                          // хотя бы один слой загружен
-    int count(std::string_view layer) const;     // -1 = слоя нет/не готов
-    std::string entity(std::string_view layer, int index) const;   // "" = нет
-    int items_count(std::string_view layer, int index) const;
-    std::string item(std::string_view layer, int index, int item_idx) const;
-
-    // Игрок: запрос ставится в очередь (заберёт воркер), статус — для скрипта.
-    void request_player(std::string_view uid);
-    bool has_request(std::string& uid);          // воркер забирает один запрос
-    // "" = ещё не готов; "MISS" = нет в базе; иначе packed-строка
-    std::string player(std::string_view uid) const;
-    int player_items_count(std::string_view uid) const;
-    std::string player_item(std::string_view uid, int item_idx) const;
-
-private:
-    mutable std::mutex mx_;
-    std::map<std::string, std::vector<RestoredEntity>> layers_;
-    std::map<std::string, std::optional<RestoredPlayer>> players_;  // nullopt = нет
-    std::vector<std::string> requests_;
-};
-
-Restore& restore();
+enum class WipeScope { World, Players, All };
+// Удалить с диска; в базу удаление попадёт следующим проходом sync. Число файлов.
+int wipe(const fs::Path& root, WipeScope scope);
 
 }  // namespace dpdb
